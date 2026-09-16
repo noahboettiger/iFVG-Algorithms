@@ -108,8 +108,8 @@ Selectable by `stop_mode`:
 | Mode | Placement |
 |---|---|
 | `swing` | The sweep extreme, as the Asia model does today (default) |
-| `confirming_wick` | Beyond the wick of the candle that confirmed the inversion |
-| `prior_candle` | Beyond the wick of the candle before the confirming candle |
+| `gap_middle_candle` | Beyond the wick of the **second** candle of the original gap, which sits just past the inverted zone |
+| `prior_candle` | Beyond the wick of the candle before the one that inverted the gap |
 | `gap_far_edge` | Beyond the far boundary of the inverted gap |
 
 `swing` is the widest and gives the trade the most room; the others size larger
@@ -126,10 +126,12 @@ drawn from the same registry, respecting rank when two are close.
 A setup with no qualifying target in its direction is not tradeable. This is the
 mechanical form of the ratings guide's "targets are clear" criterion.
 
-**R cap.** When `target_r_cap` is set, the trade exits at that R multiple even
-when the liquidity target sits further away. The liquidity level still governs
-*validity*; the cap governs the *exit*. When the level is nearer than the cap,
-the nearer of the two is used.
+**R cap.** When `target_r_cap` is set, the trade exits at that R multiple,
+full stop. The liquidity level still governs *validity* and a setup without one
+is not tradeable, but the cap governs the exit even in the rare case where the
+level is nearer. The point of the cap is to bank a known R on a trade whose full
+draw might be three times that, so letting a nearby level override it would
+defeat it.
 
 ## 8. Scoring
 
@@ -161,10 +163,23 @@ Position sizing to a fixed dollar risk, the re-arm mechanism for a second
 attempt after a deeper sweep, break-even at an R multiple, the diagnostic
 drawing mode, per-weekday toggles and the CSV export.
 
-## Open questions
+## Session definitions
 
-1. Does `confirming_wick` mean the confirming candle's own wick, or the wick of
-   the third candle of the original fair value gap?
-2. With the R cap enabled and a liquidity target nearer than the cap, take the
-   nearer one. Confirm.
-3. The name of the strategy class and file.
+Used both as entry windows and as sources for session high/low levels. All are
+configurable; these are the defaults.
+
+| Window | Default |
+|---|---|
+| Asia session (for levels) | 6:00 PM - 2:00 AM |
+| London session (for levels) | 2:00 AM - 8:00 AM |
+| Asia entry window | 7:00 PM - 9:00 PM |
+| New York entry window | 9:30 AM - 11:30 AM |
+
+## Build order
+
+1. **Level registry**, with diagnostic drawing. Verified against a hand markup
+   before anything else is built, because a level the code gets wrong invalidates
+   every trade that references it.
+2. Sessions and the arming condition.
+3. Scoring.
+4. Stops and targets.
