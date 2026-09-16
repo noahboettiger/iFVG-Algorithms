@@ -31,6 +31,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 		FirstConfirmation
 	}
 
+	public enum AsiaIfvgTargetMode
+	{
+		OppositeLevel,
+		FixedRMultiple,
+		FixedPoints
+	}
+
 	public class AsiaSessionSweepIfvg : Strategy
 	{
 		#region Nested state
@@ -138,6 +145,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 				FlattenBeforeNextSession	= false;
 				MaxContracts				= 0;			// 0 means no cap
 				MaxTradesPerSession			= 1;
+				TargetMode					= AsiaIfvgTargetMode.OppositeLevel;
+				TargetRMultiple				= 1.0;
+				TargetPoints				= 20;
 				StopBufferTicks				= 0;			// ticks beyond the sweep extreme
 				MaxSweepDepthPoints			= 0;			// 0 disables the depth cap
 				MaxCloseDistancePastGap		= 0;			// 0 disables the chase guard
@@ -592,7 +602,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 				}
 			}
 
-			if (lowSweptAt != DateTime.MinValue && highSweptAt != DateTime.MinValue)
+			// Only fatal when the opposite level is the target. A fixed R or point
+			// target does not care that the other side was taken.
+			if (lowSweptAt != DateTime.MinValue && highSweptAt != DateTime.MinValue
+				&& TargetMode == AsiaIfvgTargetMode.OppositeLevel)
 			{
 				FinishSession("both_levels_swept");
 				return;
@@ -767,6 +780,29 @@ namespace NinjaTrader.NinjaScript.Strategies
 			pendingInversions.Clear();
 		}
 
+		/// <summary>
+		/// The opposite level is the original model and gives the largest winners,
+		/// but two thirds of trades give back most of their favorable excursion
+		/// reaching for it. A fixed R or point target trades that upside for a much
+		/// higher hit rate, which suits a prop account better.
+		/// </summary>
+		private double ResolveTarget(double entry, double risk)
+		{
+			switch (TargetMode)
+			{
+				case AsiaIfvgTargetMode.FixedRMultiple:
+					return direction == 1
+						? entry + TargetRMultiple * risk
+						: entry - TargetRMultiple * risk;
+
+				case AsiaIfvgTargetMode.FixedPoints:
+					return direction == 1 ? entry + TargetPoints : entry - TargetPoints;
+
+				default:
+					return direction == 1 ? rangeHigh : rangeLow;
+			}
+		}
+
 		private bool TryEnter(Inversion inversion, DateTime closeTime)
 		{
 			double entry	= inversion.Close;
@@ -774,15 +810,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 			// on the second test, so allow a buffer beyond the extreme.
 			double buffer	= StopBufferTicks * TickSize;
 			double stop		= direction == 1 ? sweepExtreme - buffer : sweepExtreme + buffer;
-			double target	= direction == 1 ? rangeHigh : rangeLow;
 			double risk		= Math.Abs(entry - stop);
-			double reward	= Math.Abs(target - entry);
 
 			if (risk <= 0)
 			{
 				FinishSession("size_zero");
 				return false;
 			}
+
+			double target	= ResolveTarget(entry, risk);
+			double reward	= Math.Abs(target - entry);
 
 			double pointValue	= PointValueOverride > 0
 				? PointValueOverride
@@ -1070,6 +1107,20 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[Range(1, 10)]
 		[Display(Name = "Max trades per session", Order = 9, GroupName = "2. Entry")]
 		public int MaxTradesPerSession { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Target mode", Order = 1, GroupName = "6. Target")]
+		public AsiaIfvgTargetMode TargetMode { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0.1, 100)]
+		[Display(Name = "Target R multiple (FixedRMultiple)", Order = 2, GroupName = "6. Target")]
+		public double TargetRMultiple { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0.25, 10000)]
+		[Display(Name = "Target points (FixedPoints)", Order = 3, GroupName = "6. Target")]
+		public double TargetPoints { get; set; }
 
 		[NinjaScriptProperty]
 		[Display(Name = "Use 30 second", Order = 2, GroupName = "2. Entry")]

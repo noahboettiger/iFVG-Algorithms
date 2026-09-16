@@ -179,9 +179,24 @@ out of trades that dip and then recover.
 
 ## 9. Take profit
 
-The opposite level, exactly. Long targets `range_high`, short targets
-`range_low`. If the opposite level was already swept at any point before entry,
-the trade is skipped (section 4).
+`target_mode` selects one of three:
+
+**`opposite_level`** (default) - The other side of the range, exactly. Long
+targets `range_high`, short targets `range_low`. If that level was already swept
+before entry there is no target left and the trade is skipped (section 4).
+
+**`fixed_r`** - `target_r_multiple` times the trade's own risk, measured from the
+entry. Trades the largest winners away for a much higher hit rate.
+
+**`fixed_points`** - `target_points` from the entry.
+
+Both fixed modes are indifferent to the opposite level being swept, so that
+condition only ends a session in `opposite_level` mode.
+
+The original model produces the biggest winners and the worst hit rate: across
+seven years, average favorable excursion is 1.30R while two thirds of trades
+give nearly all of it back reaching for a level they never touch. A fixed target
+exists to test whether capturing less of the move more often is worth more.
 
 ## 10. Position sizing
 
@@ -220,6 +235,9 @@ analysed and blocking every setup in between.
 | `max_sweep_depth_points` | off | Points past the level before the setup is void |
 | `max_close_distance_past_gap` | off | How far past the gap a close may land, x range |
 | `break_even_at_r` | off | R multiple at which the stop moves to entry |
+| `target_mode` | opposite level | Or a fixed R multiple, or fixed points |
+| `target_r_multiple` | 1.0 | Used in fixed R mode |
+| `target_points` | 20 | Used in fixed points mode |
 | `enabled_weekdays` | Sun-Thu | Per-weekday on/off, keyed to the 6 PM session date |
 | `apply_slippage` | off | Ticks of adverse fill on entries and stops |
 | `slippage_ticks` | 1.0 | Used when slippage is on |
