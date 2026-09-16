@@ -480,10 +480,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 				: level.Rank == 2 ? Brushes.MediumPurple
 				: Brushes.Gray;
 
-			Draw.Line(this, level.Tag, false, level.CreatedAt, level.Price, finish, level.Price,
+			NinjaTrader.NinjaScript.DrawingTools.Draw.Line(this, level.Tag, false, level.CreatedAt, level.Price, finish, level.Price,
 				brush, level.Rank >= 4 ? DashStyleHelper.Solid : DashStyleHelper.Dot,
 				level.Rank >= 5 ? 2 : 1);
-			Draw.Text(this, level.Tag + "T", false, Describe(level.Source),
+			NinjaTrader.NinjaScript.DrawingTools.Draw.Text(this, level.Tag + "T", false, Describe(level.Source),
 				level.CreatedAt, level.Price, level.IsHigh ? 6 : -6, brush,
 				new SimpleFont("Arial", 9), System.Windows.TextAlignment.Left,
 				Brushes.Transparent, Brushes.Transparent, 0);
