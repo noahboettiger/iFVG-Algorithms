@@ -70,36 +70,52 @@ with other levels anyway.
 Fair value gaps live in the registry alongside liquidity levels, but they are a
 different primitive and need their own lifecycle. A liquidity level is a price
 you **sweep**, and it is dead once taken. A gap is a zone price **delivers
-from**, and being traded through does not end it, it flips it.
+from**, and a tap does not end it.
 
-| State | Meaning |
-|---|---|
-| `unfilled` | Price has not traded into the zone |
-| `tapped` | Price has traded inside but no close has passed the far edge |
-| `inverted` | A close on the gap's own timeframe passed the far edge |
-
-An inverted gap is not removed. It is exactly what the entry model trades, and
-the ratings guide lists an inverted higher timeframe gap as a draw on liquidity,
-so it stays on the books with its role reversed.
-
-**Timeframes.** Gaps are detected on the same series the swing levels use: 15m,
-1h and 4h. A gap is detected when its third candle closes, and drawn from the
-close of its first candle, which is where the box starts in a hand markup.
-
-**Size floor.** Small gaps are everywhere. Without a floor the chart is
-unreadable and "delivery from a gap" is satisfied almost always, which would
-make it worthless as a discriminator in the `both` arming mode. Two filters,
-either usable alone:
-
-| Setting | Default | Notes |
+| State | Trigger | Still a draw? |
 |---|---|---|
-| `min_gap_points` | 0 (off) | Absolute floor in index points |
-| `min_gap_percent_of_price` | 0.03 | Percent of price, about 9 points at 29,000 |
+| `unfilled` | Price has not entered the zone | Yes |
+| `tapped` | Price traded inside but stayed above / below CE | Yes, degraded |
+| `mitigated` | Price reached consequent encroachment, the 50% midpoint | No |
+| `inverted` | A close on the gap's own timeframe passed the far edge | No, it is now an entry object |
 
-The percentage default is what ships, because a fixed point threshold that is
-right at 29,000 is wrong across the 2019 to 2026 price range the backtest
-covers. Like `swing_strength`, this is a calibration against a hand markup, not
-a value to be assumed correct.
+**Consequent encroachment is the kill line.** Half the imbalance rebalanced is
+enough; the gap stops being a draw on liquidity there rather than on a full
+fill. Each tap short of CE drains the gap a little, so `taps` is recorded and
+available to scoring, but a tapped gap is still a valid target.
+
+**Inversion wins over mitigation.** Reaching CE and closing past the far edge
+are not mutually exclusive: every inversion passes through CE on the way. The
+fine series flags CE the moment it is touched, which correctly removes the gap
+from the target set straight away, and the gap's own timeframe close upgrades it
+to `inverted` if the close went all the way through. A bar that does both
+inverted the gap, it did not spend it.
+
+**Higher timeframe gaps are targeted unfilled, never inverted.** A 15m and up
+gap is a draw on liquidity only while it is `unfilled` or `tapped`. Inverse fair
+value gaps are the *entry* mechanism on the low timeframe ladder and are never a
+target. These are two different uses of the same shape and the registry keeps
+them apart.
+
+**Timeframe is the filter, not size.** Only 15m, 1h, 4h and daily gaps are
+registered, each individually toggleable. Below 15m a gap belongs to the entry
+ladder in section 4, not here. Two size floors exist and are **off by default**,
+available only if the timeframe cut turns out to leave too much on the chart:
+
+| Setting | Default |
+|---|---|
+| `min_gap_points` | 0 (off) |
+| `min_gap_percent_of_price` | 0 (off) |
+
+**Drawing.** A gap is detected when its third candle closes and drawn from the
+close of its first, which is where the box starts in a hand markup. The box runs
+`gap_extend_bars` bars of its own timeframe (default 12) and stops early if the
+gap is mitigated or inverted before that. Gaps are numerous enough that
+extending every one to the right edge makes the chart unreadable, and the box
+only has to say where the gap is.
+
+Gaps carry their own `gap_lookback_days` (default 30), separate from the level
+lookback, because a daily gap stays relevant far longer than a 15m swing high.
 
 Gaps are used in three places: the `both` arming condition, the break-even
 fallback when no internal extreme exists between entry and target (section 5),
