@@ -6,10 +6,15 @@
 // would reference it, so the registry is verified against a hand markup before
 // entries are built on top of it.
 //
-// Killzone windows and the mitigation behaviour follow the ICT Killzones &
-// Pivots indicator (tradeforopp) that the same levels are read from by hand.
 // A level is live until price trades through it; after that it is mitigated,
 // its line stops extending, and it is no longer a sweep or target candidate.
+//
+// Gaps are not levels and do not share that lifecycle. They answer two separate
+// questions with two separate rules: consequent encroachment decides whether a
+// gap is still a draw worth targeting, and first touch plus a confirm delay
+// decides whether it is still a virgin PDA worth delivering from. Session
+// windows and the gap rules follow iFVG Ultimate (DodgysDD); see the cross-check
+// section of SPEC-INVERSION.md for what was adopted from it and what was not.
 
 #region Using declarations
 using System;
@@ -30,6 +35,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 	public enum IfvgLevelSource
 	{
 		PreviousDay,
+		PreviousWeek,
 		Daily,
 		FourHour,
 		OneHour,
@@ -69,6 +75,26 @@ namespace NinjaTrader.NinjaScript.Strategies
 		ChartOnly
 	}
 
+	/// <summary>Minimum gap size as a multiple of ATR on the gap's own timeframe.</summary>
+	public enum IfvgGapSensitivity
+	{
+		Off,
+		Sensitive,
+		Normal,
+		Strict
+	}
+
+	/// <summary>
+	/// Single treats each three candle gap on its own. Series merges adjacent and
+	/// overlapping gaps of the same direction into one zone, so an inversion has
+	/// to close through the whole cluster rather than through one slice of it.
+	/// </summary>
+	public enum IfvgGapDetection
+	{
+		Single,
+		Series
+	}
+
 	public class IfvgModel : Strategy
 	{
 		#region Nested state
@@ -87,6 +113,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			public IfvgGapState		State;
 			public int				Taps;
 			public bool				Inside;
+			public DateTime			FirstTouchAt;
 			public string			Tag;
 
 			public double Height { get { return Top - Bottom; } }
@@ -98,13 +125,28 @@ namespace NinjaTrader.NinjaScript.Strategies
 			public double FarEdge { get { return Bearish ? Top : Bottom; } }
 
 			/// <summary>
-			/// Only an unfilled or lightly tapped gap is a draw on liquidity. A
-			/// mitigated one is spent and an inverted one is an entry object on the
-			/// low timeframes, not something to target.
+			/// Is there still a draw left here to target? Consequent encroachment
+			/// answers this: half the imbalance rebalanced and the gap is spent. An
+			/// inverted gap is an entry object on the low timeframes, not a target.
 			/// </summary>
 			public bool IsDrawOnLiquidity
 			{
 				get { return State == IfvgGapState.Unfilled || State == IfvgGapState.Tapped; }
+			}
+
+			/// <summary>
+			/// Is this a virgin PDA we are delivering from? A different question, so
+			/// a different rule: the gap stays virgin until price has been inside it
+			/// for longer than the confirm delay. The delay is the point. An entry
+			/// forming off a fresh tap is delivery from an untouched gap, and a rule
+			/// that killed the gap on contact would reject the very setup it is
+			/// meant to find.
+			/// </summary>
+			public bool IsVirginPda(DateTime now, int confirmBars)
+			{
+				if (FirstTouchAt == DateTime.MinValue)
+					return true;
+				return (now - FirstTouchAt).TotalMinutes <= (double)confirmBars * Minutes;
 			}
 		}
 
@@ -132,6 +174,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			public bool				IsDaily;
 			public List<double>		Highs = new List<double>();
 			public List<double>		Lows = new List<double>();
+			public List<double>		Closes = new List<double>();
 			public List<DateTime>	Times = new List<DateTime>();
 		}
 
@@ -156,6 +199,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private List<Killzone>		killzones;
 		private int					fineBip		= -1;
 		private int					dailyBip	= -1;
+		private int					weeklyBip	= -1;
 		private int					chartMinutes;
 
 		#region Lifecycle
@@ -175,6 +219,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				KeepMitigated		= false;
 
 				UsePreviousDay		= true;
+				UsePreviousWeek		= true;
 				UseFourHour			= true;
 				UseOneHour			= true;
 				UseFifteenMinute	= true;
@@ -195,15 +240,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 				ShowGapLabels			= false;	// the labels were most of the mess
 				GapExtendBars			= 12;
 				GapLookbackDays			= 30;
-				MinGapPoints			= 0;	// both floors off by default
-				MinGapPercentOfPrice	= 0;
+				GapSensitivity			= IfvgGapSensitivity.Normal;
+				GapDetection			= IfvgGapDetection.Single;
+				AtrPeriod				= 14;
+				MitigationConfirmBars	= 15;	// from the indicator
+				MinGapPoints			= 0;	// the ATR floor is the real filter
 
 				// Defaults taken from the ICT Killzones & Pivots indicator.
 				AsiaWindow			= "2000-0000";
 				LondonWindow		= "0200-0500";
-				NewYorkAmWindow		= "0930-1100";
+				NewYorkAmWindow		= "0900-1130";
 				NewYorkLunchWindow	= "1200-1300";
-				NewYorkPmWindow		= "1330-1600";
+				NewYorkPmWindow		= "1300-1600";
 
 				ShowLevels			= true;
 				ShowLevelLabels		= true;
@@ -216,6 +264,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				AddDataSeries(BarsPeriodType.Minute, 60);
 				AddDataSeries(BarsPeriodType.Minute, 240);
 				AddDataSeries(BarsPeriodType.Day, 1);
+				AddDataSeries(BarsPeriodType.Week, 1);
 			}
 			else if (State == State.DataLoaded)
 			{
@@ -304,7 +353,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		/// </summary>
 		private void ResolveSeriesIndexes()
 		{
-			fineBip = dailyBip = -1;
+			fineBip = dailyBip = weeklyBip = -1;
 			for (int i = 0; i < BarsArray.Length; i++)
 			{
 				if (BarsArray[i] == null)
@@ -312,6 +361,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 				BarsPeriod bp = BarsArray[i].BarsPeriod;
 				if (bp.BarsPeriodType == BarsPeriodType.Day && dailyBip < 0)
 					dailyBip = i;
+				else if (bp.BarsPeriodType == BarsPeriodType.Week && weeklyBip < 0)
+					weeklyBip = i;
 				else if (bp.BarsPeriodType == BarsPeriodType.Minute && bp.Value == 1 && fineBip < 0)
 					fineBip = i;
 			}
@@ -372,6 +423,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (BarsInProgress == dailyBip)
 				RegisterPreviousDay();
 
+			if (BarsInProgress == weeklyBip)
+			{
+				RegisterPreviousWeek();
+				return;
+			}
+
 			foreach (PivotSeries each in pivots)
 				if (each.Bip == BarsInProgress)
 				{
@@ -396,6 +453,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 			AddLevel(Lows[dailyBip][0], stamp, IfvgLevelSource.PreviousDay, false, 5);
 		}
 
+		private void RegisterPreviousWeek()
+		{
+			if (!UsePreviousWeek || weeklyBip < 0 || CurrentBars[weeklyBip] < 1)
+				return;
+
+			DateTime stamp = Times[weeklyBip][0];
+			AddLevel(Highs[weeklyBip][0], stamp, IfvgLevelSource.PreviousWeek, true, 6);
+			AddLevel(Lows[weeklyBip][0], stamp, IfvgLevelSource.PreviousWeek, false, 6);
+		}
+
 		/// <summary>
 		/// A pivot is confirmed once SwingStrength bars have closed either side of
 		/// it, so it registers with the timestamp of the pivot bar rather than the
@@ -408,6 +475,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			each.Highs.Add(Highs[each.Bip][0]);
 			each.Lows.Add(Lows[each.Bip][0]);
+			each.Closes.Add(Closes[each.Bip][0]);
 			each.Times.Add(Times[each.Bip][0]);
 
 			int window = SwingStrength * 2 + 1;
@@ -415,6 +483,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				each.Highs.RemoveAt(0);
 				each.Lows.RemoveAt(0);
+				each.Closes.RemoveAt(0);
 				each.Times.RemoveAt(0);
 			}
 			// Gap work runs on every closed bar; pivots need the confirmation window.
@@ -446,6 +515,41 @@ namespace NinjaTrader.NinjaScript.Strategies
 		/// it printed on, not its size, so the series list is the filter and the
 		/// size floors below are off by default.
 		/// </summary>
+		/// <summary>
+		/// Average true range over the series' own last AtrPeriod bars, computed
+		/// from the buffers already kept rather than a per series indicator
+		/// instance. Returns 0 when there is not enough history, which disables the
+		/// size filter rather than rejecting everything.
+		/// </summary>
+		private double SeriesAtr(PivotSeries each)
+		{
+			int n = each.Highs.Count;
+			if (n < AtrPeriod + 1)
+				return 0;
+
+			double sum = 0;
+			for (int i = n - AtrPeriod; i < n; i++)
+			{
+				double prevClose = each.Closes[i - 1];
+				double tr = Math.Max(each.Highs[i] - each.Lows[i],
+					Math.Max(Math.Abs(each.Highs[i] - prevClose),
+						Math.Abs(prevClose - each.Lows[i])));
+				sum += tr;
+			}
+			return sum / AtrPeriod;
+		}
+
+		private double SensitivityMultiple()
+		{
+			switch (GapSensitivity)
+			{
+				case IfvgGapSensitivity.Sensitive:	return 0.15;
+				case IfvgGapSensitivity.Normal:		return 0.35;
+				case IfvgGapSensitivity.Strict:		return 0.75;
+				default:							return 0;
+			}
+		}
+
 		private void DetectGap(PivotSeries each)
 		{
 			if (!each.GapsEnabled || each.Highs.Count < 3)
@@ -595,6 +699,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 				bool inside = high >= zone.Bottom && low <= zone.Top;
 				if (inside && !zone.Inside)
 					zone.Taps++;
+				if (inside && zone.FirstTouchAt == DateTime.MinValue)
+					zone.FirstTouchAt = stamp;
 				zone.Inside = inside;
 
 				bool reachedCe = zone.Bearish ? high >= zone.Ce : low <= zone.Ce;
@@ -628,9 +734,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 
 			// This loop runs on every one minute bar, so a dead zone left in the
-			// list is paid for thousands of times over.
+			// list is paid for thousands of times over. A CE-dead gap still has to
+			// survive its confirm delay though: it is no longer a target, but it is
+			// still the virgin PDA an entry may be delivering from.
 			if (died)
-				zones.RemoveAll(delegate(Zone z) { return z.State == IfvgGapState.Mitigated; });
+				zones.RemoveAll(delegate(Zone z)
+				{
+					return z.State == IfvgGapState.Mitigated
+						&& !z.IsVirginPda(stamp, MitigationConfirmBars);
+				});
 		}
 
 		#endregion
@@ -702,7 +814,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 			double height = top - bottom;
 			if (MinGapPoints > 0 && height < MinGapPoints)
 				return;
-			if (MinGapPercentOfPrice > 0 && height < top * MinGapPercentOfPrice / 100.0)
+
+			// Size in ATR, not points or percent. A points threshold right at
+			// 29,000 is wrong at 7,000, and a percentage ignores how much the
+			// instrument is actually moving.
+			double atr = SeriesAtr(series);
+			double floor = atr * SensitivityMultiple();
+			if (floor > 0 && height < floor)
 				return;
 
 			foreach (Zone existing in zones)
@@ -710,6 +828,25 @@ namespace NinjaTrader.NinjaScript.Strategies
 					&& Math.Abs(existing.Top - top) < TickSize / 2
 					&& Math.Abs(existing.Bottom - bottom) < TickSize / 2)
 					return;
+
+			// In series mode a fresh gap that touches a live one of the same
+			// direction absorbs into it, so the inversion has to close through the
+			// whole cluster rather than through one slice.
+			if (GapDetection == IfvgGapDetection.Series)
+				foreach (Zone existing in zones)
+				{
+					if (existing.Source != series.Source || existing.Bearish != bearish
+						|| existing.State != IfvgGapState.Unfilled)
+						continue;
+					if (top < existing.Bottom || bottom > existing.Top)
+						continue;
+
+					existing.Top	= Math.Max(existing.Top, top);
+					existing.Bottom	= Math.Min(existing.Bottom, bottom);
+					existing.CreatedAt = created;
+					DrawZone(existing);
+					return;
+				}
 
 			Zone zone = new Zone
 			{
@@ -840,6 +977,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			switch (source)
 			{
 				case IfvgLevelSource.PreviousDay:	return "PD";
+				case IfvgLevelSource.PreviousWeek:	return "PW";
 				case IfvgLevelSource.Daily:			return "1D";
 				case IfvgLevelSource.FourHour:		return "4H";
 				case IfvgLevelSource.OneHour:		return "1H";
@@ -881,44 +1019,48 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public bool UsePreviousDay { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "4 hour swings", Order = 2, GroupName = "2. Sources")]
+		[Display(Name = "Previous week high/low", Order = 2, GroupName = "2. Sources")]
+		public bool UsePreviousWeek { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "4 hour swings", Order = 3, GroupName = "2. Sources")]
 		public bool UseFourHour { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "1 hour swings", Order = 3, GroupName = "2. Sources")]
+		[Display(Name = "1 hour swings", Order = 4, GroupName = "2. Sources")]
 		public bool UseOneHour { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "15 minute swings", Order = 4, GroupName = "2. Sources")]
+		[Display(Name = "15 minute swings", Order = 5, GroupName = "2. Sources")]
 		public bool UseFifteenMinute { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Asia high/low", Order = 5, GroupName = "2. Sources")]
+		[Display(Name = "Asia high/low", Order = 6, GroupName = "2. Sources")]
 		public bool UseAsia { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "London high/low", Order = 6, GroupName = "2. Sources")]
+		[Display(Name = "London high/low", Order = 7, GroupName = "2. Sources")]
 		public bool UseLondon { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "NY AM high/low", Order = 7, GroupName = "2. Sources")]
+		[Display(Name = "NY AM high/low", Order = 8, GroupName = "2. Sources")]
 		public bool UseNewYorkAm { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "NY Lunch high/low", Order = 8, GroupName = "2. Sources")]
+		[Display(Name = "NY Lunch high/low", Order = 9, GroupName = "2. Sources")]
 		public bool UseNewYorkLunch { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "NY PM high/low", Order = 9, GroupName = "2. Sources")]
+		[Display(Name = "NY PM high/low", Order = 10, GroupName = "2. Sources")]
 		public bool UseNewYorkPm { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Relative equal highs/lows", Order = 10, GroupName = "2. Sources")]
+		[Display(Name = "Relative equal highs/lows", Order = 11, GroupName = "2. Sources")]
 		public bool UseEqualHighLow { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, 50)]
-		[Display(Name = "Equal tolerance (ticks)", Order = 11, GroupName = "2. Sources")]
+		[Display(Name = "Equal tolerance (ticks)", Order = 12, GroupName = "2. Sources")]
 		public int EqualToleranceTicks { get; set; }
 
 		[NinjaScriptProperty]
@@ -957,14 +1099,29 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public int GapLookbackDays { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(0, 10000)]
-		[Display(Name = "Minimum gap size (points, 0 = off)", Order = 7, GroupName = "2b. Gaps")]
-		public double MinGapPoints { get; set; }
+		[Display(Name = "Gap sensitivity (size in ATR)", Order = 7, GroupName = "2b. Gaps")]
+		public IfvgGapSensitivity GapSensitivity { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(0, 100)]
-		[Display(Name = "Minimum gap size (% of price, 0 = off)", Order = 8, GroupName = "2b. Gaps")]
-		public double MinGapPercentOfPrice { get; set; }
+		[Display(Name = "Gap detection", Order = 8, GroupName = "2b. Gaps",
+			Description = "Series merges adjacent gaps of the same direction into one zone.")]
+		public IfvgGapDetection GapDetection { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(2, 200)]
+		[Display(Name = "ATR period", Order = 10, GroupName = "2b. Gaps")]
+		public int AtrPeriod { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 500)]
+		[Display(Name = "Mitigation confirm delay (bars)", Order = 11, GroupName = "2b. Gaps",
+			Description = "Bars after price first enters a gap before it stops counting as a virgin PDA for delivery. Targeting uses consequent encroachment instead.")]
+		public int MitigationConfirmBars { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 10000)]
+		[Display(Name = "Minimum gap size (points, 0 = off)", Order = 12, GroupName = "2b. Gaps")]
+		public double MinGapPoints { get; set; }
 
 		[NinjaScriptProperty]
 		[Display(Name = "Asia window (HHmm-HHmm)", Order = 1, GroupName = "3. Killzones")]

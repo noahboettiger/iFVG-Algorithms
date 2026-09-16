@@ -39,6 +39,7 @@ measured rather than assumed.
 | Source | Definition |
 |---|---|
 | `prev_day` | Previous day's high and low |
+| `prev_week` | Previous week's high and low |
 | `h4` | Swing highs and lows on the 4-hour |
 | `h1` | Swing highs and lows on the 1-hour |
 | `m15` | Swing highs and lows on the 15-minute |
@@ -49,7 +50,7 @@ measured rather than assumed.
 | `ny_pm` | New York PM killzone high and low |
 | `eqh_eql` | Relative equal highs and lows |
 
-**Ranking.** Higher timeframe outranks lower. `prev_day` > `h4` > `h1` > `m15` >
+**Ranking.** Higher timeframe outranks lower. `prev_week` > `prev_day` > `h4` > `h1` > `m15` >
 killzone > `eqh_eql`. Rank is used for scoring and for choosing between competing
 targets, not for eligibility.
 
@@ -97,15 +98,27 @@ value gaps are the *entry* mechanism on the low timeframe ladder and are never a
 target. These are two different uses of the same shape and the registry keeps
 them apart.
 
-**Timeframe is the filter, not size.** Only 15m, 1h, 4h and daily gaps are
+**Timeframe is the first filter.** Only 15m, 1h, 4h and daily gaps are
 registered, each individually toggleable. Below 15m a gap belongs to the entry
-ladder in section 4, not here. Two size floors exist and are **off by default**,
-available only if the timeframe cut turns out to leave too much on the chart:
+ladder in section 4, not here.
 
-| Setting | Default |
+**Size is the second filter, measured in ATR** on the gap's own timeframe. A
+threshold in points that is right at 29,000 is wrong at 7,000, and a percentage
+of price ignores how much the instrument is actually moving.
+
+| `gap_sensitivity` | ATR multiple |
 |---|---|
-| `min_gap_points` | 0 (off) |
-| `min_gap_percent_of_price` | 0 (off) |
+| `sensitive` | 0.15 |
+| `normal` | 0.35 (default) |
+| `strict` | 0.75 |
+
+`min_gap_points` remains as an absolute override, off by default. The three
+sensitivity names come from the indicator; the multiples behind them are this
+model's guess and need checking against a hand markup.
+
+**`gap_detection`** is `single` or `series`. In `series` a fresh gap that
+touches a live one of the same direction absorbs into it, so an inversion has to
+close through the whole cluster rather than through one slice of it.
 
 **Drawing.** A gap is detected when its third candle closes and drawn from the
 close of its first, which is where the box starts in a hand markup. The box runs
@@ -253,9 +266,9 @@ code and the hand markup read the same levels.
 |---|---|
 | Asia killzone | 8:00 PM - 12:00 AM |
 | London killzone | 2:00 AM - 5:00 AM |
-| New York AM killzone | 9:30 AM - 11:00 AM |
+| New York AM killzone | 9:00 AM - 11:30 AM |
 | New York lunch killzone | 12:00 PM - 1:00 PM |
-| New York PM killzone | 1:30 PM - 4:00 PM |
+| New York PM killzone | 1:00 PM - 4:00 PM |
 | Asia entry window | 7:00 PM - 9:00 PM |
 | New York entry window | 9:30 AM - 11:30 AM |
 
@@ -316,26 +329,31 @@ a different rule from requiring a close through one of them.
 **Grades become C, B-, B+, A, A+**, matching the indicator, with `min_grade`
 defaulting to A. Five buckets across a five point score rather than four.
 
-### Open decisions
+### Resolved
 
-**Gap mitigation** is the one real disagreement. The indicator treats a gap as
-mitigated once price first entered it more than `mitigation_confirm_delay` bars
-ago, default 15, specifically so that a fresh tap producing an immediate
-inversion still counts as virgin. This spec uses consequent encroachment.
+**Mitigation is split by purpose**, because the two rules answer two questions:
 
-These answer different questions and may both be right: first-touch-plus-delay
-asks "is this a virgin PDA we are delivering from", CE asks "is there still a
-draw left here to target". Pending a decision, both are implemented and
-selectable by `gap_mitigation_mode`.
+| Question | Rule |
+|---|---|
+| Is there still a draw here to target? | Consequent encroachment |
+| Is this a virgin PDA we are delivering from? | First touch, plus `mitigation_confirm_bars` (default 15) |
 
-**Session windows** disagree, because they were taken from different indicators:
+The confirm delay is the whole point of the second rule. An entry forming off a
+fresh tap **is** delivery from an untouched gap, and a rule that killed the gap
+on contact would reject the setup it exists to find. A CE-dead gap therefore
+stays in the registry until its confirm delay also expires: no longer a target,
+still a valid delivery source.
 
-| Window | This spec (ICT Killzones & Pivots) | iFVG Ultimate |
-|---|---|---|
-| NY AM | 9:30 - 11:00 | 9:00 - 11:30 |
-| NY PM | 1:30 - 4:00 | 1:00 - 4:00 |
-| Asia | 8:00 PM - 12:00 AM | same |
-| London | 2:00 - 5:00 AM | same |
+**Session windows follow iFVG Ultimate**, so a hand check on the chart and the
+backtest always read the same session extremes: NY AM 9:00 - 11:30 and NY PM
+1:00 - 4:00. Asia and London already agreed.
+
+**SMT is a scoring axis, not a filter.** It is the only axis carrying
+information from outside the instrument, which also makes it the one with no
+evidence behind it yet. Logged on every setup, never blocks a trade, until the
+backtest says whether it predicts anything.
+
+### Still to calibrate
 
 **`max_bars_to_invert`** has real anchors now: the indicator requires an IFVG to
 form within 6 candles, or 15 with "Allow 7-15 Candle IFVGs" on. Both are worth
