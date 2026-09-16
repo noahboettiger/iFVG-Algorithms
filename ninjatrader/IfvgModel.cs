@@ -41,9 +41,40 @@ namespace NinjaTrader.NinjaScript.Strategies
 		EqualHighLow
 	}
 
+	/// <summary>
+	/// Unfilled means price has not entered the zone. Tapped means it has traded
+	/// inside but not closed through. Inverted means a close on the gap's own
+	/// timeframe went past the far edge, flipping the zone's role rather than
+	/// killing it.
+	/// </summary>
+	public enum IfvgGapState
+	{
+		Unfilled,
+		Tapped,
+		Inverted
+	}
+
 	public class IfvgModel : Strategy
 	{
 		#region Nested state
+
+		private class Zone
+		{
+			public double			Top;
+			public double			Bottom;
+			public DateTime			CreatedAt;
+			public DateTime			StartsAt;
+			public IfvgLevelSource	Source;
+			public int				Rank;
+			public bool				Bearish;
+			public IfvgGapState		State;
+			public string			Tag;
+
+			public double Height { get { return Top - Bottom; } }
+
+			/// <summary>The edge a close must pass to invert the zone.</summary>
+			public double FarEdge { get { return Bearish ? Top : Bottom; } }
+		}
 
 		private class Level
 		{
@@ -86,6 +117,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		#endregion
 
 		private List<Level>			levels;
+		private List<Zone>			zones;
 		private List<PivotSeries>	pivots;
 		private List<Killzone>		killzones;
 		private int					fineBip		= -1;
@@ -119,6 +151,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 				UseEqualHighLow		= false;
 				EqualToleranceTicks	= 5;
 
+				UseHtfGaps			= true;
+				MinGapPoints		= 0;		// 0 disables the absolute floor
+				MinGapPercentOfPrice = 0.03;	// 0.03% of price, about 9 points at 29,000
+
 				// Defaults taken from the ICT Killzones & Pivots indicator.
 				AsiaWindow			= "2000-0000";
 				LondonWindow		= "0200-0500";
@@ -140,6 +176,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			else if (State == State.DataLoaded)
 			{
 				levels = new List<Level>();
+				zones = new List<Zone>();
 				pivots = new List<PivotSeries>
 				{
 					new PivotSeries { Minutes = 15,  Source = IfvgLevelSource.FifteenMinute, Rank = 2, Enabled = UseFifteenMinute },
@@ -310,6 +347,60 @@ namespace NinjaTrader.NinjaScript.Strategies
 				AddLevel(each.Highs[pivot], each.Times[pivot], each.Source, true, each.Rank);
 			if (isLow)
 				AddLevel(each.Lows[pivot], each.Times[pivot], each.Source, false, each.Rank);
+
+			DetectGap(each);
+			CheckInversions(each);
+		}
+
+		/// <summary>
+		/// The standard three candle gap, measured on the most recent completed
+		/// bars of this timeframe. Small gaps are everywhere and would make
+		/// "delivery from a gap" true almost always, so a size floor is applied.
+		/// </summary>
+		private void DetectGap(PivotSeries each)
+		{
+			if (!UseHtfGaps || each.Highs.Count < 3)
+				return;
+
+			int last = each.Highs.Count - 1;
+			double c1High = each.Highs[last - 2], c1Low = each.Lows[last - 2];
+			double c3High = each.Highs[last],     c3Low = each.Lows[last];
+
+			// The gap only becomes known when c3 closes, but it belongs on the
+			// chart where it opened. c1's close time is c2's open, which is where
+			// the killzone indicator and a hand markup both start the box.
+			DateTime created = each.Times[last];
+			DateTime startsAt = each.Times[last - 2];
+
+			if (c3High < c1Low)
+				AddZone(c3High, c1Low, created, startsAt, each.Source, each.Rank, true);
+			else if (c3Low > c1High)
+				AddZone(c1High, c3Low, created, startsAt, each.Source, each.Rank, false);
+		}
+
+		/// <summary>
+		/// A zone inverts on a close through its far edge, measured on the zone's
+		/// own timeframe rather than the fine series.
+		/// </summary>
+		private void CheckInversions(PivotSeries each)
+		{
+			double close = Closes[each.Bip][0];
+			foreach (Zone zone in zones)
+			{
+				if (zone.Source != each.Source || zone.State == IfvgGapState.Inverted)
+					continue;
+				bool through = zone.Bearish ? close > zone.Top : close < zone.Bottom;
+				if (!through)
+					continue;
+
+				zone.State = IfvgGapState.Inverted;
+				if (LogLevels)
+					Print(string.Format("{0:yyyy-MM-dd HH:mm}  INVERTED {1} {2} gap {3} to {4}",
+						Times[each.Bip][0], Describe(zone.Source),
+						zone.Bearish ? "bearish" : "bullish",
+						Format(zone.Bottom), Format(zone.Top)));
+				DrawZone(zone);
+			}
 		}
 
 		/// <summary>
@@ -389,6 +480,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (!KeepMitigated)
 				levels.RemoveAll(delegate(Level l) { return l.Mitigated; });
 
+			foreach (Zone zone in zones)
+			{
+				if (zone.State != IfvgGapState.Unfilled)
+					continue;
+				if (high < zone.Bottom || low > zone.Top)
+					continue;
+				zone.State = IfvgGapState.Tapped;
+				DrawZone(zone);
+			}
+
 			Prune(stamp);
 		}
 
@@ -455,6 +556,43 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 		}
 
+		private void AddZone(double bottom, double top, DateTime created,
+			DateTime startsAt, IfvgLevelSource source, int rank, bool bearish)
+		{
+			double height = top - bottom;
+			if (MinGapPoints > 0 && height < MinGapPoints)
+				return;
+			if (MinGapPercentOfPrice > 0 && height < top * MinGapPercentOfPrice / 100.0)
+				return;
+
+			foreach (Zone existing in zones)
+				if (existing.Source == source
+					&& Math.Abs(existing.Top - top) < TickSize / 2
+					&& Math.Abs(existing.Bottom - bottom) < TickSize / 2)
+					return;
+
+			Zone zone = new Zone
+			{
+				Top			= top,
+				Bottom		= bottom,
+				CreatedAt	= created,
+				StartsAt	= startsAt,
+				Source		= source,
+				Rank		= rank,
+				Bearish		= bearish,
+				State		= IfvgGapState.Unfilled,
+				Tag			= "gap" + source + created.Ticks + (bearish ? "B" : "U"),
+			};
+			zones.Add(zone);
+
+			if (LogLevels)
+				Print(string.Format("{0:yyyy-MM-dd HH:mm}  {1} {2} gap {3} to {4}  ({5} pts)",
+					created, Describe(source), bearish ? "bearish" : "bullish",
+					Format(bottom), Format(top), Format(height)));
+
+			DrawZone(zone);
+		}
+
 		private void Prune(DateTime now)
 		{
 			DateTime cutoff = now.AddDays(-LevelLookbackDays);
@@ -463,6 +601,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 			foreach (Level each in stale)
 				Erase(each);
 			levels.RemoveAll(delegate(Level l) { return l.CreatedAt < cutoff; });
+
+			List<Zone> expired = zones.FindAll(
+				delegate(Zone z) { return z.CreatedAt < cutoff; });
+			if (ShowLevels)
+				foreach (Zone each in expired)
+				{
+					RemoveDrawObject(each.Tag);
+					RemoveDrawObject(each.Tag + "T");
+				}
+			zones.RemoveAll(delegate(Zone z) { return z.CreatedAt < cutoff; });
 		}
 
 		#endregion
@@ -487,6 +635,31 @@ namespace NinjaTrader.NinjaScript.Strategies
 				level.CreatedAt, level.Price, level.IsHigh ? 6 : -6, brush,
 				new SimpleFont("Arial", 9), System.Windows.TextAlignment.Left,
 				Brushes.Transparent, Brushes.Transparent, 0);
+		}
+
+		/// <summary>
+		/// Unfilled zones draw solid, tapped ones fade, inverted ones switch colour
+		/// because their role has flipped rather than ended.
+		/// </summary>
+		private void DrawZone(Zone zone)
+		{
+			if (!ShowLevels)
+				return;
+
+			Brush edge = zone.State == IfvgGapState.Inverted
+				? (zone.Bearish ? Brushes.LimeGreen : Brushes.Crimson)
+				: (zone.Bearish ? Brushes.IndianRed : Brushes.CornflowerBlue);
+			int opacity = zone.State == IfvgGapState.Unfilled ? 22
+				: zone.State == IfvgGapState.Tapped ? 10 : 30;
+
+			NinjaTrader.NinjaScript.DrawingTools.Draw.Rectangle(this, zone.Tag, false,
+				zone.StartsAt, zone.Bottom,
+				zone.CreatedAt.AddDays(LevelLookbackDays), zone.Top,
+				Brushes.Transparent, edge, opacity);
+			NinjaTrader.NinjaScript.DrawingTools.Draw.Text(this, zone.Tag + "T", false,
+				Describe(zone.Source) + (zone.State == IfvgGapState.Inverted ? " iFVG" : " FVG"),
+				zone.StartsAt, zone.Top, 4, edge, new SimpleFont("Arial", 9),
+				System.Windows.TextAlignment.Left, Brushes.Transparent, Brushes.Transparent, 0);
 		}
 
 		private void StopExtending(Level level)
@@ -586,6 +759,20 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[Range(1, 50)]
 		[Display(Name = "Equal tolerance (ticks)", Order = 11, GroupName = "2. Sources")]
 		public int EqualToleranceTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Higher timeframe gaps", Order = 1, GroupName = "2b. Gaps")]
+		public bool UseHtfGaps { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 10000)]
+		[Display(Name = "Minimum gap size (points, 0 = off)", Order = 2, GroupName = "2b. Gaps")]
+		public double MinGapPoints { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 100)]
+		[Display(Name = "Minimum gap size (% of price, 0 = off)", Order = 3, GroupName = "2b. Gaps")]
+		public double MinGapPercentOfPrice { get; set; }
 
 		[NinjaScriptProperty]
 		[Display(Name = "Asia window (HHmm-HHmm)", Order = 1, GroupName = "3. Killzones")]

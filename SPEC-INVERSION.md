@@ -65,6 +65,46 @@ within 5 ticks, first low below the second. A second extreme that exceeds the
 first is a break, not an equal. Off by default, since in practice these coincide
 with other levels anyway.
 
+## 2b. Gap registry
+
+Fair value gaps live in the registry alongside liquidity levels, but they are a
+different primitive and need their own lifecycle. A liquidity level is a price
+you **sweep**, and it is dead once taken. A gap is a zone price **delivers
+from**, and being traded through does not end it, it flips it.
+
+| State | Meaning |
+|---|---|
+| `unfilled` | Price has not traded into the zone |
+| `tapped` | Price has traded inside but no close has passed the far edge |
+| `inverted` | A close on the gap's own timeframe passed the far edge |
+
+An inverted gap is not removed. It is exactly what the entry model trades, and
+the ratings guide lists an inverted higher timeframe gap as a draw on liquidity,
+so it stays on the books with its role reversed.
+
+**Timeframes.** Gaps are detected on the same series the swing levels use: 15m,
+1h and 4h. A gap is detected when its third candle closes, and drawn from the
+close of its first candle, which is where the box starts in a hand markup.
+
+**Size floor.** Small gaps are everywhere. Without a floor the chart is
+unreadable and "delivery from a gap" is satisfied almost always, which would
+make it worthless as a discriminator in the `both` arming mode. Two filters,
+either usable alone:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `min_gap_points` | 0 (off) | Absolute floor in index points |
+| `min_gap_percent_of_price` | 0.03 | Percent of price, about 9 points at 29,000 |
+
+The percentage default is what ships, because a fixed point threshold that is
+right at 29,000 is wrong across the 2019 to 2026 price range the backtest
+covers. Like `swing_strength`, this is a calibration against a hand markup, not
+a value to be assumed correct.
+
+Gaps are used in three places: the `both` arming condition, the break-even
+fallback when no internal extreme exists between entry and target (section 5),
+and as a draw on liquidity target.
+
 ## 3. Arming condition
 
 A setup is armed by a liquidity sweep, by delivery from a higher timeframe FVG,
@@ -197,9 +237,9 @@ a place later it will be as a scoring input, not as a sweep target.
 
 ## Build order
 
-1. **Level registry**, with diagnostic drawing. Verified against a hand markup
-   before anything else is built, because a level the code gets wrong invalidates
-   every trade that references it.
+1. **Level and gap registry**, with diagnostic drawing. Verified against a hand
+   markup before anything else is built, because a level the code gets wrong
+   invalidates every trade that references it.
 2. Sessions and the arming condition.
 3. Scoring.
 4. Stops and targets.
