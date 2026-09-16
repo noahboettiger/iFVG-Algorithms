@@ -419,7 +419,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				Print(string.Format("{0:yyyy-MM-dd HH:mm}  {1} {2} at {3}",
 					created, Describe(source), isHigh ? "high" : "low", Format(price)));
 
-			Draw(level, created.AddDays(LevelLookbackDays));
+			DrawLevel(level, created.AddDays(LevelLookbackDays));
 			if (UseEqualHighLow)
 				ScanForEqualPairs(level);
 		}
@@ -469,7 +469,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		#region Drawing
 
-		private void Draw(Level level, DateTime finish)
+		private void DrawLevel(Level level, DateTime finish)
 		{
 			if (!ShowLevels)
 				return;
@@ -491,7 +491,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		private void StopExtending(Level level)
 		{
-			Draw(level, level.MitigatedAt);
+			DrawLevel(level, level.MitigatedAt);
 		}
 
 		private void Erase(Level level)
