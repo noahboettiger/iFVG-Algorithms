@@ -6,8 +6,10 @@
 // would reference it, so the registry is verified against a hand markup before
 // entries are built on top of it.
 //
-// Sources: previous day extremes, swing highs and lows on 4H, 1H and 15m, Asia
-// and London session extremes, and optionally relative equal highs and lows.
+// Killzone windows and the mitigation behaviour follow the ICT Killzones &
+// Pivots indicator (tradeforopp) that the same levels are read from by hand.
+// A level is live until price trades through it; after that it is mitigated,
+// its line stops extending, and it is no longer a sweep or target candidate.
 
 #region Using declarations
 using System;
@@ -31,8 +33,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 		FourHour,
 		OneHour,
 		FifteenMinute,
-		AsiaSession,
-		LondonSession,
+		Asia,
+		London,
+		NewYorkAm,
+		NewYorkLunch,
+		NewYorkPm,
 		EqualHighLow
 	}
 
@@ -45,55 +50,46 @@ namespace NinjaTrader.NinjaScript.Strategies
 			public double			Price;
 			public DateTime			CreatedAt;
 			public IfvgLevelSource	Source;
+			public string			Tag;
 			public bool				IsHigh;
 			public int				Rank;
-			public bool				Swept;
-			public DateTime			SweptAt;
-
-			public string Label
-			{
-				get
-				{
-					switch (Source)
-					{
-						case IfvgLevelSource.PreviousDay:		return "PDH/PDL";
-						case IfvgLevelSource.FourHour:			return "4H";
-						case IfvgLevelSource.OneHour:			return "1H";
-						case IfvgLevelSource.FifteenMinute:		return "15m";
-						case IfvgLevelSource.AsiaSession:		return "ASIA";
-						case IfvgLevelSource.LondonSession:		return "LDN";
-						default:								return "EQ";
-					}
-				}
-			}
+			public bool				Mitigated;
+			public DateTime			MitigatedAt;
 		}
 
-		/// <summary>One monitored series, with the rolling window used to find pivots.</summary>
-		private class Series
+		/// <summary>A monitored timeframe, with the rolling window used to find pivots.</summary>
+		private class PivotSeries
 		{
 			public int				Minutes;
 			public int				Bip;
 			public IfvgLevelSource	Source;
+			public int				Rank;
 			public bool				Enabled;
 			public List<double>		Highs = new List<double>();
 			public List<double>		Lows = new List<double>();
 			public List<DateTime>	Times = new List<DateTime>();
 		}
 
+		/// <summary>A killzone whose extremes become levels once the window closes.</summary>
+		private class Killzone
+		{
+			public string			Name;
+			public IfvgLevelSource	Source;
+			public int				StartSec;
+			public int				EndSec;
+			public bool				Enabled;
+			public double			High;
+			public double			Low;
+			public bool				Building;
+		}
+
 		#endregion
 
-		private List<Level>		levels;
-		private List<Series>	series;
-		private int				fineBip = -1;
-
-		private DateTime		sessionDay		= DateTime.MinValue;
-		private double			asiaHigh, asiaLow;
-		private bool			asiaValid;
-		private double			londonHigh, londonLow;
-		private bool			londonValid;
-		private bool			asiaPosted, londonPosted;
-
-		private int asiaStartSec, asiaEndSec, londonStartSec, londonEndSec;
+		private List<Level>			levels;
+		private List<PivotSeries>	pivots;
+		private List<Killzone>		killzones;
+		private int					fineBip		= -1;
+		private int					dailyBip	= -1;
 
 		#region Lifecycle
 
@@ -108,71 +104,95 @@ namespace NinjaTrader.NinjaScript.Strategies
 				BarsRequiredToTrade = 20;
 
 				SwingStrength		= 3;
-				MaxLevelsPerSource	= 8;
 				LevelLookbackDays	= 5;
+				KeepMitigated		= false;
 
 				UsePreviousDay		= true;
 				UseFourHour			= true;
 				UseOneHour			= true;
 				UseFifteenMinute	= true;
-				UseAsiaSession		= true;
-				UseLondonSession	= true;
+				UseAsia				= true;
+				UseLondon			= true;
+				UseNewYorkAm		= true;
+				UseNewYorkLunch		= false;
+				UseNewYorkPm		= false;
 				UseEqualHighLow		= false;
-				EqualTolerelanceTicks = 5;
+				EqualToleranceTicks	= 5;
 
-				AsiaSessionStart	= 1800;
-				AsiaSessionEnd		= 200;
-				LondonSessionStart	= 200;
-				LondonSessionEnd	= 800;
+				// Defaults taken from the ICT Killzones & Pivots indicator.
+				AsiaWindow			= "2000-0000";
+				LondonWindow		= "0200-0500";
+				NewYorkAmWindow		= "0930-1100";
+				NewYorkLunchWindow	= "1200-1300";
+				NewYorkPmWindow		= "1330-1600";
 
 				ShowLevels			= true;
 				LogLevels			= true;
 			}
 			else if (State == State.Configure)
 			{
-				// Finest series drives session tracking and sweep detection.
 				AddDataSeries(BarsPeriodType.Minute, 1);
 				AddDataSeries(BarsPeriodType.Minute, 15);
 				AddDataSeries(BarsPeriodType.Minute, 60);
 				AddDataSeries(BarsPeriodType.Minute, 240);
 				AddDataSeries(BarsPeriodType.Day, 1);
-
-				asiaStartSec	= ToSeconds(AsiaSessionStart);
-				asiaEndSec		= ToSeconds(AsiaSessionEnd);
-				londonStartSec	= ToSeconds(LondonSessionStart);
-				londonEndSec	= ToSeconds(LondonSessionEnd);
 			}
 			else if (State == State.DataLoaded)
 			{
 				levels = new List<Level>();
-				series = new List<Series>
+				pivots = new List<PivotSeries>
 				{
-					new Series { Minutes = 15,  Source = IfvgLevelSource.FifteenMinute, Enabled = UseFifteenMinute },
-					new Series { Minutes = 60,  Source = IfvgLevelSource.OneHour,       Enabled = UseOneHour },
-					new Series { Minutes = 240, Source = IfvgLevelSource.FourHour,      Enabled = UseFourHour },
+					new PivotSeries { Minutes = 15,  Source = IfvgLevelSource.FifteenMinute, Rank = 2, Enabled = UseFifteenMinute },
+					new PivotSeries { Minutes = 60,  Source = IfvgLevelSource.OneHour,       Rank = 3, Enabled = UseOneHour },
+					new PivotSeries { Minutes = 240, Source = IfvgLevelSource.FourHour,      Rank = 4, Enabled = UseFourHour },
+				};
+				killzones = new List<Killzone>
+				{
+					MakeKillzone("Asia",      IfvgLevelSource.Asia,         AsiaWindow,          UseAsia),
+					MakeKillzone("London",    IfvgLevelSource.London,       LondonWindow,        UseLondon),
+					MakeKillzone("NY AM",     IfvgLevelSource.NewYorkAm,    NewYorkAmWindow,     UseNewYorkAm),
+					MakeKillzone("NY Lunch",  IfvgLevelSource.NewYorkLunch, NewYorkLunchWindow,  UseNewYorkLunch),
+					MakeKillzone("NY PM",     IfvgLevelSource.NewYorkPm,    NewYorkPmWindow,     UseNewYorkPm),
 				};
 				ResolveSeriesIndexes();
 			}
 		}
 
+		private Killzone MakeKillzone(string name, IfvgLevelSource source, string window, bool enabled)
+		{
+			int dash	= window.IndexOf('-');
+			int start	= int.Parse(window.Substring(0, dash));
+			int end		= int.Parse(window.Substring(dash + 1));
+			return new Killzone
+			{
+				Name		= name,
+				Source		= source,
+				StartSec	= ToSeconds(start),
+				EndSec		= ToSeconds(end),
+				Enabled		= enabled,
+			};
+		}
+
 		/// <summary>
 		/// Find each series by its loaded period rather than assuming the order in
-		/// which AddDataSeries handed out indexes, which can shift when the primary
+		/// which AddDataSeries handed out indexes, which shifts when the primary
 		/// series happens to match one of them.
 		/// </summary>
 		private void ResolveSeriesIndexes()
 		{
-			fineBip = -1;
+			fineBip = dailyBip = -1;
 			for (int i = 0; i < BarsArray.Length; i++)
 			{
 				if (BarsArray[i] == null)
 					continue;
 				BarsPeriod bp = BarsArray[i].BarsPeriod;
-				if (bp.BarsPeriodType == BarsPeriodType.Minute && bp.Value == 1 && fineBip < 0)
+				if (bp.BarsPeriodType == BarsPeriodType.Day && dailyBip < 0)
+					dailyBip = i;
+				else if (bp.BarsPeriodType == BarsPeriodType.Minute && bp.Value == 1 && fineBip < 0)
 					fineBip = i;
 			}
 
-			foreach (Series each in series)
+			foreach (PivotSeries each in pivots)
 			{
 				each.Bip = -1;
 				for (int i = 0; i < BarsArray.Length; i++)
@@ -188,25 +208,20 @@ namespace NinjaTrader.NinjaScript.Strategies
 				}
 			}
 
-			dailyBip = -1;
-			for (int i = 0; i < BarsArray.Length; i++)
-				if (BarsArray[i] != null && BarsArray[i].BarsPeriod.BarsPeriodType == BarsPeriodType.Day)
-				{
-					dailyBip = i;
-					break;
-				}
-
 			Print("");
 			Print("IfvgModel level registry loaded:");
 			Print(string.Format("    1m   -> {0}", Describe(fineBip)));
-			foreach (Series each in series)
+			foreach (PivotSeries each in pivots)
 				Print(string.Format("    {0,-4} -> {1}{2}", each.Minutes + "m", Describe(each.Bip),
-					each.Enabled ? "" : "  (disabled)"));
+					each.Enabled ? "" : "  (off)"));
 			Print(string.Format("    day  -> {0}", Describe(dailyBip)));
+			foreach (Killzone kz in killzones)
+				Print(string.Format("    {0,-9} {1:00}:{2:00} to {3:00}:{4:00}{5}", kz.Name,
+					kz.StartSec / 3600, kz.StartSec % 3600 / 60,
+					kz.EndSec / 3600, kz.EndSec % 3600 / 60,
+					kz.Enabled ? "" : "  (off)"));
 			Print("");
 		}
-
-		private int dailyBip = -1;
 
 		private string Describe(int bip)
 		{
@@ -233,18 +248,20 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 			}
 
-			foreach (Series each in series)
+			foreach (PivotSeries each in pivots)
 				if (each.Bip == BarsInProgress)
 				{
-					TrackSwings(each);
+					TrackPivots(each);
 					return;
 				}
 
 			if (BarsInProgress == fineBip)
-				TrackSessions();
+			{
+				TrackKillzones();
+				MarkMitigations();
+			}
 		}
 
-		/// <summary>Previous trading day's extremes, taken from the completed daily bar.</summary>
 		private void RegisterPreviousDay()
 		{
 			if (!UsePreviousDay || CurrentBars[dailyBip] < 1)
@@ -256,11 +273,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 		}
 
 		/// <summary>
-		/// A pivot is confirmed once SwingStrength bars have closed on each side of
-		/// it, so the level is registered with the timestamp of the pivot bar rather
-		/// than the bar that confirmed it.
+		/// A pivot is confirmed once SwingStrength bars have closed either side of
+		/// it, so it registers with the timestamp of the pivot bar rather than the
+		/// bar that confirmed it.
 		/// </summary>
-		private void TrackSwings(Series each)
+		private void TrackPivots(PivotSeries each)
 		{
 			if (!each.Enabled || each.Bip < 0)
 				return;
@@ -270,8 +287,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			each.Times.Add(Times[each.Bip][0]);
 
 			int window = SwingStrength * 2 + 1;
-			int keep = Math.Max(window, 60);
-			if (each.Highs.Count > keep)
+			if (each.Highs.Count > Math.Max(window, 60))
 			{
 				each.Highs.RemoveAt(0);
 				each.Lows.RemoveAt(0);
@@ -281,75 +297,52 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 
 			int pivot = each.Highs.Count - 1 - SwingStrength;
-			int rank = each.Minutes >= 240 ? 4 : each.Minutes >= 60 ? 3 : 2;
-
-			bool isSwingHigh = true, isSwingLow = true;
+			bool isHigh = true, isLow = true;
 			for (int i = pivot - SwingStrength; i <= pivot + SwingStrength; i++)
 			{
 				if (i == pivot)
 					continue;
-				if (each.Highs[i] >= each.Highs[pivot]) isSwingHigh = false;
-				if (each.Lows[i] <= each.Lows[pivot])   isSwingLow = false;
+				if (each.Highs[i] >= each.Highs[pivot]) isHigh = false;
+				if (each.Lows[i] <= each.Lows[pivot])   isLow = false;
 			}
 
-			if (isSwingHigh)
-				AddLevel(each.Highs[pivot], each.Times[pivot], each.Source, true, rank);
-			if (isSwingLow)
-				AddLevel(each.Lows[pivot], each.Times[pivot], each.Source, false, rank);
+			if (isHigh)
+				AddLevel(each.Highs[pivot], each.Times[pivot], each.Source, true, each.Rank);
+			if (isLow)
+				AddLevel(each.Lows[pivot], each.Times[pivot], each.Source, false, each.Rank);
 		}
 
-		/// <summary>Asia and London extremes, accumulated on the 1-minute series.</summary>
-		private void TrackSessions()
+		/// <summary>
+		/// Killzone extremes accumulate while the window is open and register as
+		/// levels the moment it closes, matching how the indicator draws them.
+		/// </summary>
+		private void TrackKillzones()
 		{
 			DateTime stamp	= Times[fineBip][0];
 			int tod			= stamp.Hour * 3600 + stamp.Minute * 60 + stamp.Second;
 			double high		= Highs[fineBip][0];
 			double low		= Lows[fineBip][0];
 
-			if (stamp.Date != sessionDay)
+			foreach (Killzone kz in killzones)
 			{
-				sessionDay	= stamp.Date;
-				londonValid	= false;
-				londonPosted = false;
-			}
+				bool inside = InWindow(tod, kz.StartSec, kz.EndSec);
 
-			if (InWindow(tod, asiaStartSec, asiaEndSec))
-			{
-				asiaHigh	= asiaValid ? Math.Max(asiaHigh, high) : high;
-				asiaLow		= asiaValid ? Math.Min(asiaLow, low)   : low;
-				asiaValid	= true;
-				asiaPosted	= false;
-			}
-			else if (asiaValid && !asiaPosted)
-			{
-				asiaPosted = true;
-				if (UseAsiaSession)
+				if (inside)
 				{
-					AddLevel(asiaHigh, stamp, IfvgLevelSource.AsiaSession, true, 2);
-					AddLevel(asiaLow, stamp, IfvgLevelSource.AsiaSession, false, 2);
+					kz.High		= kz.Building ? Math.Max(kz.High, high) : high;
+					kz.Low		= kz.Building ? Math.Min(kz.Low, low)   : low;
+					kz.Building	= true;
 				}
-				asiaValid = false;
-			}
-
-			if (InWindow(tod, londonStartSec, londonEndSec))
-			{
-				londonHigh	= londonValid ? Math.Max(londonHigh, high) : high;
-				londonLow	= londonValid ? Math.Min(londonLow, low)   : low;
-				londonValid	= true;
-				londonPosted = false;
-			}
-			else if (londonValid && !londonPosted)
-			{
-				londonPosted = true;
-				if (UseLondonSession)
+				else if (kz.Building)
 				{
-					AddLevel(londonHigh, stamp, IfvgLevelSource.LondonSession, true, 2);
-					AddLevel(londonLow, stamp, IfvgLevelSource.LondonSession, false, 2);
+					kz.Building = false;
+					if (kz.Enabled)
+					{
+						AddLevel(kz.High, stamp, kz.Source, true, 2);
+						AddLevel(kz.Low, stamp, kz.Source, false, 2);
+					}
 				}
-				londonValid = false;
 			}
-
-			MarkSweeps(high, low, stamp);
 		}
 
 		/// <summary>Windows that cross midnight wrap, so the test flips accordingly.</summary>
@@ -360,22 +353,43 @@ namespace NinjaTrader.NinjaScript.Strategies
 				: tod >= start || tod < end;
 		}
 
-		private void MarkSweeps(double high, double low, DateTime stamp)
+		/// <summary>
+		/// Once price trades through a level the pool behind it is gone. The level
+		/// stops extending and drops out of the candidate set entirely: it can no
+		/// longer arm a setup, and it can no longer be a target.
+		/// </summary>
+		private void MarkMitigations()
 		{
+			DateTime stamp	= Times[fineBip][0];
+			double high		= Highs[fineBip][0];
+			double low		= Lows[fineBip][0];
+
 			foreach (Level level in levels)
 			{
-				if (level.Swept)
+				if (level.Mitigated)
 					continue;
 				bool taken = level.IsHigh ? high > level.Price : low < level.Price;
 				if (!taken)
 					continue;
 
-				level.Swept = true;
-				level.SweptAt = stamp;
+				level.Mitigated		= true;
+				level.MitigatedAt	= stamp;
+
 				if (LogLevels)
-					Print(string.Format("{0:yyyy-MM-dd HH:mm}  swept {1} {2} at {3}",
-						stamp, level.Label, level.IsHigh ? "high" : "low", Format(level.Price)));
+					Print(string.Format("{0:yyyy-MM-dd HH:mm}  MITIGATED {1} {2} at {3}",
+						stamp, Describe(level.Source), level.IsHigh ? "high" : "low",
+						Format(level.Price)));
+
+				if (KeepMitigated)
+					StopExtending(level);
+				else
+					Erase(level);
 			}
+
+			if (!KeepMitigated)
+				levels.RemoveAll(delegate(Level l) { return l.Mitigated; });
+
+			Prune(stamp);
 		}
 
 		#endregion
@@ -385,7 +399,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private void AddLevel(double price, DateTime created, IfvgLevelSource source,
 			bool isHigh, int rank)
 		{
-			// A level at the same price from the same source is the same level.
 			foreach (Level existing in levels)
 				if (existing.Source == source && existing.IsHigh == isHigh
 					&& Math.Abs(existing.Price - price) < TickSize / 2)
@@ -398,17 +411,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 				Source		= source,
 				IsHigh		= isHigh,
 				Rank		= rank,
+				Tag			= "lvl" + source + created.Ticks + (isHigh ? "H" : "L"),
 			};
 			levels.Add(level);
 
 			if (LogLevels)
 				Print(string.Format("{0:yyyy-MM-dd HH:mm}  {1} {2} at {3}",
-					created, level.Label, isHigh ? "high" : "low", Format(price)));
+					created, Describe(source), isHigh ? "high" : "low", Format(price)));
 
-			DrawLevel(level);
+			Draw(level, created.AddDays(LevelLookbackDays));
 			if (UseEqualHighLow)
 				ScanForEqualPairs(level);
-			Prune();
 		}
 
 		/// <summary>
@@ -420,10 +433,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (latest.Source == IfvgLevelSource.EqualHighLow)
 				return;
 
-			double tolerance = EqualTolerelanceTicks * TickSize;
+			double tolerance = EqualToleranceTicks * TickSize;
 			foreach (Level prior in levels)
 			{
-				if (prior == latest || prior.IsHigh != latest.IsHigh)
+				if (prior == latest || prior.IsHigh != latest.IsHigh || prior.Mitigated)
 					continue;
 				if (prior.CreatedAt >= latest.CreatedAt)
 					continue;
@@ -442,34 +455,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 		}
 
-		private void Prune()
+		private void Prune(DateTime now)
 		{
-			DateTime cutoff = Times[BarsInProgress][0].AddDays(-LevelLookbackDays);
+			DateTime cutoff = now.AddDays(-LevelLookbackDays);
+			List<Level> stale = levels.FindAll(
+				delegate(Level l) { return l.CreatedAt < cutoff; });
+			foreach (Level each in stale)
+				Erase(each);
 			levels.RemoveAll(delegate(Level l) { return l.CreatedAt < cutoff; });
-
-			foreach (IfvgLevelSource source in Enum.GetValues(typeof(IfvgLevelSource)))
-			{
-				IfvgLevelSource captured = source;
-				List<Level> ofSource = levels.FindAll(
-					delegate(Level l) { return l.Source == captured; });
-				if (ofSource.Count <= MaxLevelsPerSource * 2)
-					continue;
-
-				ofSource.Sort(delegate(Level a, Level b)
-				{
-					return a.CreatedAt.CompareTo(b.CreatedAt);
-				});
-				int excess = ofSource.Count - MaxLevelsPerSource * 2;
-				for (int i = 0; i < excess; i++)
-					levels.Remove(ofSource[i]);
-			}
 		}
 
 		#endregion
 
 		#region Drawing
 
-		private void DrawLevel(Level level)
+		private void Draw(Level level, DateTime finish)
 		{
 			if (!ShowLevels)
 				return;
@@ -480,15 +480,43 @@ namespace NinjaTrader.NinjaScript.Strategies
 				: level.Rank == 2 ? Brushes.MediumPurple
 				: Brushes.Gray;
 
-			string tag = "lvl" + level.Source + level.CreatedAt.Ticks + (level.IsHigh ? "H" : "L");
-			DateTime finish = level.CreatedAt.AddHours(Math.Max(LevelLookbackDays, 1) * 24);
-
-			Draw.Line(this, tag, false, level.CreatedAt, level.Price, finish, level.Price,
+			Draw.Line(this, level.Tag, false, level.CreatedAt, level.Price, finish, level.Price,
 				brush, level.Rank >= 4 ? DashStyleHelper.Solid : DashStyleHelper.Dot,
 				level.Rank >= 5 ? 2 : 1);
-			Draw.Text(this, tag + "T", false, level.Label, level.CreatedAt, level.Price,
-				level.IsHigh ? 6 : -6, brush, new SimpleFont("Arial", 9),
-				System.Windows.TextAlignment.Left, Brushes.Transparent, Brushes.Transparent, 0);
+			Draw.Text(this, level.Tag + "T", false, Describe(level.Source),
+				level.CreatedAt, level.Price, level.IsHigh ? 6 : -6, brush,
+				new SimpleFont("Arial", 9), System.Windows.TextAlignment.Left,
+				Brushes.Transparent, Brushes.Transparent, 0);
+		}
+
+		private void StopExtending(Level level)
+		{
+			Draw(level, level.MitigatedAt);
+		}
+
+		private void Erase(Level level)
+		{
+			if (!ShowLevels)
+				return;
+			RemoveDrawObject(level.Tag);
+			RemoveDrawObject(level.Tag + "T");
+		}
+
+		private static string Describe(IfvgLevelSource source)
+		{
+			switch (source)
+			{
+				case IfvgLevelSource.PreviousDay:	return "PD";
+				case IfvgLevelSource.FourHour:		return "4H";
+				case IfvgLevelSource.OneHour:		return "1H";
+				case IfvgLevelSource.FifteenMinute:	return "15m";
+				case IfvgLevelSource.Asia:			return "AS";
+				case IfvgLevelSource.London:		return "LO";
+				case IfvgLevelSource.NewYorkAm:		return "NYAM";
+				case IfvgLevelSource.NewYorkLunch:	return "NYL";
+				case IfvgLevelSource.NewYorkPm:		return "NYPM";
+				default:							return "EQ";
+			}
 		}
 
 		private string Format(double price)
@@ -506,14 +534,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public int SwingStrength { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(1, 50)]
-		[Display(Name = "Max levels kept per source", Order = 2, GroupName = "1. Levels")]
-		public int MaxLevelsPerSource { get; set; }
+		[Range(1, 60)]
+		[Display(Name = "Level lookback (days)", Order = 2, GroupName = "1. Levels")]
+		public int LevelLookbackDays { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(1, 60)]
-		[Display(Name = "Level lookback (days)", Order = 3, GroupName = "1. Levels")]
-		public int LevelLookbackDays { get; set; }
+		[Display(Name = "Keep mitigated levels on chart", Order = 3, GroupName = "1. Levels")]
+		public bool KeepMitigated { get; set; }
 
 		[NinjaScriptProperty]
 		[Display(Name = "Previous day high/low", Order = 1, GroupName = "2. Sources")]
@@ -532,48 +559,60 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public bool UseFifteenMinute { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Asia session high/low", Order = 5, GroupName = "2. Sources")]
-		public bool UseAsiaSession { get; set; }
+		[Display(Name = "Asia high/low", Order = 5, GroupName = "2. Sources")]
+		public bool UseAsia { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "London session high/low", Order = 6, GroupName = "2. Sources")]
-		public bool UseLondonSession { get; set; }
+		[Display(Name = "London high/low", Order = 6, GroupName = "2. Sources")]
+		public bool UseLondon { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Relative equal highs/lows", Order = 7, GroupName = "2. Sources")]
+		[Display(Name = "NY AM high/low", Order = 7, GroupName = "2. Sources")]
+		public bool UseNewYorkAm { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "NY Lunch high/low", Order = 8, GroupName = "2. Sources")]
+		public bool UseNewYorkLunch { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "NY PM high/low", Order = 9, GroupName = "2. Sources")]
+		public bool UseNewYorkPm { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Relative equal highs/lows", Order = 10, GroupName = "2. Sources")]
 		public bool UseEqualHighLow { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(1, 50)]
-		[Display(Name = "Equal tolerance (ticks)", Order = 8, GroupName = "2. Sources")]
-		public int EqualTolerelanceTicks { get; set; }
+		[Display(Name = "Equal tolerance (ticks)", Order = 11, GroupName = "2. Sources")]
+		public int EqualToleranceTicks { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(0, 2359)]
-		[Display(Name = "Asia session start (HHmm)", Order = 1, GroupName = "3. Session windows")]
-		public int AsiaSessionStart { get; set; }
+		[Display(Name = "Asia window (HHmm-HHmm)", Order = 1, GroupName = "3. Killzones")]
+		public string AsiaWindow { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(0, 2359)]
-		[Display(Name = "Asia session end (HHmm)", Order = 2, GroupName = "3. Session windows")]
-		public int AsiaSessionEnd { get; set; }
+		[Display(Name = "London window", Order = 2, GroupName = "3. Killzones")]
+		public string LondonWindow { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(0, 2359)]
-		[Display(Name = "London session start (HHmm)", Order = 3, GroupName = "3. Session windows")]
-		public int LondonSessionStart { get; set; }
+		[Display(Name = "NY AM window", Order = 3, GroupName = "3. Killzones")]
+		public string NewYorkAmWindow { get; set; }
 
 		[NinjaScriptProperty]
-		[Range(0, 2359)]
-		[Display(Name = "London session end (HHmm)", Order = 4, GroupName = "3. Session windows")]
-		public int LondonSessionEnd { get; set; }
+		[Display(Name = "NY Lunch window", Order = 4, GroupName = "3. Killzones")]
+		public string NewYorkLunchWindow { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "NY PM window", Order = 5, GroupName = "3. Killzones")]
+		public string NewYorkPmWindow { get; set; }
 
 		[NinjaScriptProperty]
 		[Display(Name = "Draw levels", Order = 1, GroupName = "4. Output")]
 		public bool ShowLevels { get; set; }
 
 		[NinjaScriptProperty]
-		[Display(Name = "Log levels and sweeps", Order = 2, GroupName = "4. Output")]
+		[Display(Name = "Log levels and mitigations", Order = 2, GroupName = "4. Output")]
 		public bool LogLevels { get; set; }
 
 		#endregion

@@ -42,13 +42,22 @@ measured rather than assumed.
 | `h4` | Swing highs and lows on the 4-hour |
 | `h1` | Swing highs and lows on the 1-hour |
 | `m15` | Swing highs and lows on the 15-minute |
-| `asia_session` | Asia session high and low |
-| `london_session` | London session high and low |
+| `asia` | Asia killzone high and low |
+| `london` | London killzone high and low |
+| `ny_am` | New York AM killzone high and low |
+| `ny_lunch` | New York lunch killzone high and low |
+| `ny_pm` | New York PM killzone high and low |
 | `eqh_eql` | Relative equal highs and lows |
 
 **Ranking.** Higher timeframe outranks lower. `prev_day` > `h4` > `h1` > `m15` >
-session > `eqh_eql`. Rank is used for scoring and for choosing between competing
+killzone > `eqh_eql`. Rank is used for scoring and for choosing between competing
 targets, not for eligibility.
+
+**Mitigation.** A level is live only until price trades through it. Once taken,
+the pool behind it is gone: the level stops extending, drops out of the candidate
+set, and can neither arm a setup nor serve as a target again. This matches the
+"Until Mitigated" behaviour of the killzone indicator the same levels are read
+from by hand.
 
 **Equal highs and lows.** Two highs are equal when they are within 5 ticks of
 each other **and the first high is above the second**. Equal lows mirror this:
@@ -168,12 +177,23 @@ drawing mode, per-weekday toggles and the CSV export.
 Used both as entry windows and as sources for session high/low levels. All are
 configurable; these are the defaults.
 
+Killzone windows are taken from the ICT Killzones & Pivots indicator, so the
+code and the hand markup read the same levels.
+
 | Window | Default |
 |---|---|
-| Asia session (for levels) | 6:00 PM - 2:00 AM |
-| London session (for levels) | 2:00 AM - 8:00 AM |
+| Asia killzone | 8:00 PM - 12:00 AM |
+| London killzone | 2:00 AM - 5:00 AM |
+| New York AM killzone | 9:30 AM - 11:00 AM |
+| New York lunch killzone | 12:00 PM - 1:00 PM |
+| New York PM killzone | 1:30 PM - 4:00 PM |
 | Asia entry window | 7:00 PM - 9:00 PM |
 | New York entry window | 9:30 AM - 11:30 AM |
+
+Opening prices (midnight, 8:30, 9:30, 9:00 PM) are deliberately **not** levels in
+this registry. An opening price is a reference for bias and for premium/discount,
+not a pool of resting orders, so "sweeping" one carries no meaning. If they earn
+a place later it will be as a scoring input, not as a sweep target.
 
 ## Build order
 
