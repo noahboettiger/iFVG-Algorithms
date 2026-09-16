@@ -57,6 +57,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 		Inverted
 	}
 
+	/// <summary>
+	/// Which gaps get drawn, by their own timeframe against the chart's. Detection
+	/// is unaffected: a hidden gap is still registered, still tracked and still a
+	/// target. This only decides what is worth putting on the screen.
+	/// </summary>
+	public enum IfvgGapVisibility
+	{
+		All,
+		ChartAndHigher,
+		ChartOnly
+	}
+
 	public class IfvgModel : Strategy
 	{
 		#region Nested state
@@ -144,6 +156,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private List<Killzone>		killzones;
 		private int					fineBip		= -1;
 		private int					dailyBip	= -1;
+		private int					chartMinutes;
 
 		#region Lifecycle
 
@@ -178,6 +191,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 				UseOneHourGaps			= true;
 				UseFourHourGaps			= true;
 				UseDailyGaps			= true;
+				GapVisibility			= IfvgGapVisibility.ChartAndHigher;
+				ShowGapLabels			= false;	// the labels were most of the mess
 				GapExtendBars			= 12;
 				GapLookbackDays			= 30;
 				MinGapPoints			= 0;	// both floors off by default
@@ -191,6 +206,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				NewYorkPmWindow		= "1330-1600";
 
 				ShowLevels			= true;
+				ShowLevelLabels		= true;
 				LogLevels			= true;
 			}
 			else if (State == State.Configure)
@@ -227,7 +243,43 @@ namespace NinjaTrader.NinjaScript.Strategies
 					MakeKillzone("NY PM",     IfvgLevelSource.NewYorkPm,    NewYorkPmWindow,     UseNewYorkPm),
 				};
 				ResolveSeriesIndexes();
+				chartMinutes = PeriodMinutes(BarsArray[0]);
 			}
+		}
+
+		/// <summary>
+		/// The chart series in minutes, for the drawing filter. Anything that does
+		/// not map onto a duration (tick, volume, range) returns 0, which shows
+		/// every gap rather than guessing.
+		/// </summary>
+		private static int PeriodMinutes(Bars bars)
+		{
+			if (bars == null)
+				return 0;
+			BarsPeriod bp = bars.BarsPeriod;
+			switch (bp.BarsPeriodType)
+			{
+				case BarsPeriodType.Minute:	return bp.Value;
+				case BarsPeriodType.Day:	return bp.Value * 1440;
+				case BarsPeriodType.Week:	return bp.Value * 1440 * 7;
+				case BarsPeriodType.Month:	return bp.Value * 1440 * 30;
+				case BarsPeriodType.Second:	return bp.Value / 60;
+				default:					return 0;
+			}
+		}
+
+		/// <summary>
+		/// A 15m gap on a daily chart is invisible clutter: too small to see, and
+		/// there are hundreds of them. Each hidden gap is also two fewer draw
+		/// objects, which is where the lag on a higher timeframe chart comes from.
+		/// </summary>
+		private bool IsVisible(Zone zone)
+		{
+			if (chartMinutes <= 0 || GapVisibility == IfvgGapVisibility.All)
+				return true;
+			return GapVisibility == IfvgGapVisibility.ChartOnly
+				? zone.Minutes == chartMinutes
+				: zone.Minutes >= chartMinutes;
 		}
 
 		private Killzone MakeKillzone(string name, IfvgLevelSource source, string window, bool enabled)
@@ -534,6 +586,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		/// </summary>
 		private void TrackGapTouches(DateTime stamp, double high, double low)
 		{
+			bool died = false;
 			foreach (Zone zone in zones)
 			{
 				if (zone.State == IfvgGapState.Mitigated || zone.State == IfvgGapState.Inverted)
@@ -556,9 +609,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 							Format(zone.Bottom), Format(zone.Top), Format(zone.Ce),
 							zone.Taps, zone.Taps == 1 ? "" : "s"));
 					if (KeepMitigated)
+					{
 						DrawZone(zone);
+					}
 					else
+					{
 						EraseZone(zone);
+						died = true;
+					}
 					continue;
 				}
 
@@ -568,6 +626,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 					DrawZone(zone);
 				}
 			}
+
+			// This loop runs on every one minute bar, so a dead zone left in the
+			// list is paid for thousands of times over.
+			if (died)
+				zones.RemoveAll(delegate(Zone z) { return z.State == IfvgGapState.Mitigated; });
 		}
 
 		#endregion
@@ -706,6 +769,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 			NinjaTrader.NinjaScript.DrawingTools.Draw.Line(this, level.Tag, false, level.CreatedAt, level.Price, finish, level.Price,
 				brush, level.Rank >= 4 ? DashStyleHelper.Solid : DashStyleHelper.Dot,
 				level.Rank >= 5 ? 2 : 1);
+
+			if (!ShowLevelLabels)
+				return;
 			NinjaTrader.NinjaScript.DrawingTools.Draw.Text(this, level.Tag + "T", false, Describe(level.Source),
 				level.CreatedAt, level.Price, level.IsHigh ? 6 : -6, brush,
 				new SimpleFont("Arial", 9), System.Windows.TextAlignment.Left,
@@ -720,7 +786,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		/// </summary>
 		private void DrawZone(Zone zone)
 		{
-			if (!ShowLevels)
+			if (!ShowLevels || !IsVisible(zone))
 				return;
 
 			Brush edge = zone.State == IfvgGapState.Inverted
@@ -739,6 +805,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 			NinjaTrader.NinjaScript.DrawingTools.Draw.Rectangle(this, zone.Tag, false,
 				zone.StartsAt, zone.Bottom, finish, zone.Top,
 				Brushes.Transparent, edge, opacity);
+
+			if (!ShowGapLabels)
+				return;
 			NinjaTrader.NinjaScript.DrawingTools.Draw.Text(this, zone.Tag + "T", false,
 				Describe(zone.Source) + (zone.State == IfvgGapState.Inverted ? " iFVG" : " FVG"),
 				zone.StartsAt, zone.Top, 4, edge, new SimpleFont("Arial", 9),
@@ -853,6 +922,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public int EqualToleranceTicks { get; set; }
 
 		[NinjaScriptProperty]
+		[Display(Name = "Show gaps on", Order = 0, GroupName = "2b. Gaps",
+			Description = "Chart and higher hides a 15m gap on a 4H chart. Detection is unaffected.")]
+		public IfvgGapVisibility GapVisibility { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Gap labels", Order = 9, GroupName = "2b. Gaps")]
+		public bool ShowGapLabels { get; set; }
+
+		[NinjaScriptProperty]
 		[Display(Name = "15m gaps", Order = 1, GroupName = "2b. Gaps")]
 		public bool UseFifteenMinuteGaps { get; set; }
 
@@ -911,6 +989,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[NinjaScriptProperty]
 		[Display(Name = "Draw levels", Order = 1, GroupName = "4. Output")]
 		public bool ShowLevels { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Level labels", Order = 2, GroupName = "4. Output")]
+		public bool ShowLevelLabels { get; set; }
 
 		[NinjaScriptProperty]
 		[Display(Name = "Log levels and mitigations", Order = 2, GroupName = "4. Output")]

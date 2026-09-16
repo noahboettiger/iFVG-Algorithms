@@ -114,6 +114,19 @@ gap is mitigated or inverted before that. Gaps are numerous enough that
 extending every one to the right edge makes the chart unreadable, and the box
 only has to say where the gap is.
 
+**Visibility is separate from detection.** A gap is drawn only when its own
+timeframe is at or above the chart's, so a 15m gap does not render on a 4H or
+daily chart. This is `gap_visibility`, with `all` and `chart_only` as
+alternatives. A hidden gap is still registered, still tracked through its
+lifecycle and still a valid target: the filter decides what is worth putting on
+screen, nothing more. Gap labels default off and level labels default on, since
+the labels rather than the boxes were what made a higher timeframe chart
+unreadable.
+
+A mitigated gap is removed from the live set unless `keep_mitigated` is on. The
+per-bar touch check runs on every one minute bar, so a dead gap left in the list
+is paid for thousands of times over.
+
 Gaps carry their own `gap_lookback_days` (default 30), separate from the level
 lookback, because a daily gap stays relevant far longer than a 15m swing high.
 
