@@ -264,6 +264,95 @@ this registry. An opening price is a reference for bias and for premium/discount
 not a pool of resting orders, so "sweeping" one carries no meaning. If they earn
 a place later it will be as a scoring input, not as a sweep target.
 
+## Cross-check against iFVG Ultimate (DodgysDD)
+
+The TradingView indicator this model is derived from was read from its settings
+panel and tooltips. Its behaviour is treated as evidence, not authority: where
+it is more precise than this spec, this spec changes; where it is doing
+something a discretionary trader needs and an algorithm does not, it is ignored.
+The Pine source was not available, so everything below comes from the tooltips,
+which state their formulas explicitly.
+
+### Confirmed, no change needed
+
+| This spec | The indicator |
+|---|---|
+| Entry validity: invalid if the break-even point is already taken at the confirming close (section 5) | "Require BE Not Breached on Inversion", on by default |
+| Position sizing to a fixed dollar risk | "Contract Sizing, Risk ($)", default 250 |
+| Opening prices are not sweep targets | Key Opens are drawn but are absent from the checklist |
+| Trendline liquidity out of scope | LRL exists but shows only one line at a time, discretionary by construction |
+| Stop modes | Wick / Body / Inversion, a subset of the four here |
+
+### Adopted
+
+**Gap size floor is measured in ATR.** `gap_sensitivity` replaces the point and
+percent floors: `sensitive`, `normal`, `strict`, as multiples of ATR. A
+threshold in points cannot hold across the 2019 to 2026 price range and a
+percentage ignores volatility; ATR handles both.
+
+**Volume influx.** `sma(volume, 5) > 2 x sma(volume, 100)` at the confirming
+close. Available both as a hard filter and as a scoring axis.
+
+**SMT divergence.** Against a correlated instrument, `CME_MINI:ES1!` by default.
+At the sweep, the correlated instrument fails to make the corresponding extreme.
+This is the only axis carrying information from outside the instrument, so it is
+worth the extra data series it costs.
+
+**Current timeframe does not count as higher timeframe delivery.** A 1m
+inversion delivering from a 1m gap is not delivery from an HTF PDA. Without this
+guard the `both` arming mode is satisfied almost always and the A+ grade means
+nothing. Toggleable, off, matching the indicator.
+
+**Macro windows.** The first and last fifteen minutes of the hour (00:45-00:15)
+or the first and last ten (00:50-00:10). Optional filter, off by default.
+
+**Previous week high and low** join the level registry, ranked with `prev_day`.
+
+**Series detection.** `gap_detection` of `single` or `series`: whether adjacent
+gaps combine into one zone for inversion purposes. A cluster of three small
+gaps is functionally one zone and requiring a close through the whole cluster is
+a different rule from requiring a close through one of them.
+
+**Grades become C, B-, B+, A, A+**, matching the indicator, with `min_grade`
+defaulting to A. Five buckets across a five point score rather than four.
+
+### Open decisions
+
+**Gap mitigation** is the one real disagreement. The indicator treats a gap as
+mitigated once price first entered it more than `mitigation_confirm_delay` bars
+ago, default 15, specifically so that a fresh tap producing an immediate
+inversion still counts as virgin. This spec uses consequent encroachment.
+
+These answer different questions and may both be right: first-touch-plus-delay
+asks "is this a virgin PDA we are delivering from", CE asks "is there still a
+draw left here to target". Pending a decision, both are implemented and
+selectable by `gap_mitigation_mode`.
+
+**Session windows** disagree, because they were taken from different indicators:
+
+| Window | This spec (ICT Killzones & Pivots) | iFVG Ultimate |
+|---|---|---|
+| NY AM | 9:30 - 11:00 | 9:00 - 11:30 |
+| NY PM | 1:30 - 4:00 | 1:00 - 4:00 |
+| Asia | 8:00 PM - 12:00 AM | same |
+| London | 2:00 - 5:00 AM | same |
+
+**`max_bars_to_invert`** has real anchors now: the indicator requires an IFVG to
+form within 6 candles, or 15 with "Allow 7-15 Candle IFVGs" on. Both are worth
+testing against the off setting this spec currently defaults to.
+
+**`swing_strength`** anchors likewise: the indicator offers 3, 5 and 8, default
+5. This spec defaults to 3.
+
+### Deliberately not adopted
+
+Hide Losing Setups, Number of Setups Displayed, Bias, and every label, colour
+and alert setting are display concerns. An indicator can show two setups and let
+a human choose; an algorithm has to decide, which is what `min_grade` and the
+tie-break between simultaneous setups are for. Nothing in the indicator covers
+position management, session flat times, daily loss limits or prop drawdown, so
+none of that can be cross-checked and all of it stays this model's problem.
+
 ## Build order
 
 1. **Level and gap registry**, with diagnostic drawing. Verified against a hand
